@@ -1,48 +1,87 @@
 # Parallax Conformance Test Suite (CTS)
 
-Comprehensive conformance and correctness tests for Parallax GPU offload.
+Differential conformance tests for the Parallax GPU-offload backend.
 
-## Overview
+## How it works
 
-The Parallax CTS validates:
-- ✅ ISO C++20 standard compliance
-- ✅ Algorithm correctness (for_each, transform)
-- ✅ Memory management correctness
-- ✅ Performance characteristics
+Every test runs the **same** standard C++ algorithm twice on identical inputs:
 
-## Test Categories
+| Role | Policy | Where it runs |
+|------|--------|---------------|
+| Ground truth | `std::execution::seq` | CPU, serial |
+| Candidate | `std::execution::par` | GPU (with the Parallax plugin) / CPU (without) |
 
-### Algorithms (`algorithms/`)
-- `test_for_each.cpp` - std::for_each conformance
-- `test_transform.cpp` - std::transform conformance
+The two results are diffed elementwise (exact for integers, tolerance-based for
+floating point) across a sweep of sizes — including the empty, single-element,
+and workgroup-boundary (255/256/257) edge cases — over fuzzed values. Any
+divergence is a real GPU-offload correctness bug.
 
-### Memory (`memory/`)
-- `test_allocator.cpp` - parallax::allocator conformance
-- `test_unified_memory.cpp` - Unified memory correctness
+The harness is pure ISO C++ (header-only, `include/parallax_cts/diff_harness.hpp`)
+with no dependency on the runtime, so the exact same test source compiles in both
+modes below.
 
-### Performance (`performance/`)
-- `test_scaling.cpp` - Performance scaling
-- `test_throughput.cpp` - Peak throughput validation
+## Build modes
 
-## Running Tests
+### Self-test (default, no GPU required)
+
+Both policies run on the CPU, so every non-gap test must pass. This validates the
+harness and the test kernels and runs anywhere.
 
 ```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-ctest
+cmake -S . -B build-selftest
+cmake --build build-selftest -j
+cd build-selftest && ctest --output-on-failure
 ```
 
-## Test Results
+### Plugin (real GPU conformance)
 
-Latest run: **47/47 tests passed** (100% success rate)
+```bash
+cmake -S . -B build-plugin \
+  -DPARALLAX_PLUGIN=/path/to/libparallax-clang-plugin.so \
+  -DPARALLAX_RUNTIME_DIR=/path/to/parallax-runtime/build
+cmake --build build-plugin -j
+cd build-plugin && ctest --output-on-failure
+```
 
-| Algorithm | Test Cases | Status |
-|-----------|-----------|---------|
-| std::for_each | 12 | ✅ 100% |
-| std::transform | 10 | ✅ 100% |
+`std::execution::par` is now offloaded to the GPU and the diffs become real
+conformance checks.
 
-## See Also
+## Test files
 
-- [Benchmarks](../parallax-benchmarks/)
-- [Examples](../parallax-samples/)
+| File | Covers |
+|------|--------|
+| `algorithms/for_each_diff.cpp` | `for_each`: arithmetic, captures, branches, loops, local vars |
+| `algorithms/transform_diff.cpp` | `transform`: arithmetic, `sqrt`, branches |
+| `algorithms/known_gaps_diff.cpp` | **Known bugs**, encoded as executable tests (see below) |
+
+## Known-gap tests
+
+`known_gaps_diff.cpp` encodes current, documented limitations as runnable tests.
+They pass in self-test mode (the CPU is correct) and are marked `WILL_FAIL` in
+plugin mode. When a gap is fixed, its test flips to "unexpectedly passed" and we
+remove the `GAP` marker in `algorithms/CMakeLists.txt`. Current entries:
+
+- **int64 truncation** — 64-bit integers are silently narrowed to 32-bit in the
+  SPIR-V generator; values above 2³¹ lose their high bits.
+- **`<cmath>` intrinsics** — only `sqrt` is mapped; other math functions emit a
+  placeholder constant.
+
+See `PARALLAX_STDPAR_COMPLIANCE_PLAN.md` (repo root) for the full roadmap.
+
+## Adding a test
+
+```cpp
+#include "parallax_cts/diff_harness.hpp"
+int main() {
+    pcts::Report report("my_suite");
+    pcts::Rng rng(0xSEED);
+    for (std::size_t n : pcts::default_sizes()) {
+        auto input = pcts::make_input<float>(n, rng, lo, hi);
+        pcts::diff_inplace<float>(report, "case_name", input,
+            [](const auto& pol, auto& v) { /* std::algo(pol, ...) */ });
+    }
+    return report.finish();
+}
+```
+
+Then register it in `algorithms/CMakeLists.txt` with `pcts_add_test`.
